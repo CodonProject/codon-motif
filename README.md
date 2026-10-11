@@ -243,4 +243,4 @@ pytest
 
 `examples/` holds runnable scripts (`verify.py` checks the environment and weights first, `chat.py` talks to the model, `generate.py` continues text, `pretrain.py` and `sft.py` train). They need `tokenizer.zip` in the repository root or in `../`. Temporary artefacts (corpora, checkpoints, the Triton kernel cache) are written under `<repo>/.tmp` and ignored.
 
-Apache-2.0. See `LICENSE`.
+Apache-2.0. See `LICENSE`. Intended use, training, evaluation and limitations are in [`MODEL_CARD.md`](https://github.com/CodonProject/codon-motif/blob/main/MODEL_CARD.md).

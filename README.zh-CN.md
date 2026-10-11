@@ -243,4 +243,4 @@ pytest
 
 `examples/` 下有可直接运行的脚本（`verify.py` 先自检环境与权重，`chat.py` 对话，`generate.py` 续写，`pretrain.py` / `sft.py` 训练）；运行需要仓库根或 `../` 下的 `tokenizer.zip`。临时产物（语料、checkpoint、Triton kernel 缓存）写在 `<repo>/.tmp` 下并被忽略。
 
-Apache-2.0，见 `LICENSE`。
+Apache-2.0，见 `LICENSE`。用途、训练、评测与局限性见 [`MODEL_CARD.md`](https://github.com/CodonProject/codon-motif/blob/main/MODEL_CARD.md)（英文）。
