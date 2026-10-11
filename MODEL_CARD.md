@@ -25,7 +25,7 @@ MotifChord-Base is a 172 M parameter decoder-only causal language model built ar
 | :--- | :--- |
 | Architecture | Decoder-only causal LM, hybrid gated delta-net + chord attention, intra-block attention residual |
 | Embedding | 40,960 × 768, tied to the output head |
-| Layers | 4 `DecoderBlock`s × 4 `Decoder`s = 16 layers; each Block holds 3 gated delta-net layers and 1 chord layer |
+| Layers | 4 blocks × 4 sub-layers = 16 layers; each block holds 3 gated delta-net layers and 1 chord layer |
 | Attention heads | 12 query heads / 3 kv heads (GQA); key head dim 64 for the gated delta-net, value expansion 2 |
 | Context | Trained in stages from 1024 up to 4096 tokens; the inference cache has no fixed limit |
 | License | Apache-2.0 |
@@ -33,11 +33,11 @@ MotifChord-Base is a 172 M parameter decoder-only causal language model built ar
 
 ## Architecture
 
-The stack is an embedding, four `DecoderBlock`s and a final RMSNorm + LM head. Inside a block, four `Decoder`s run in sequence; each one is a parallel attention-and-MLP residual, `x = x + attn(norm(x)) + mlp(norm(x))`, 768 wide, with a SwiGLU MLP.
+The stack is an embedding, four blocks and a final RMSNorm + LM head. Inside a block, four sub-layers run in sequence; each one is a parallel attention-and-MLP residual, `x = x + attn(norm(x)) + mlp(norm(x))`, 768 wide, with a SwiGLU MLP.
 
-- **Gated delta-net** (`motif/block/attention/gdn_attn.py`) carries three of the four layers with a linear-time chunked recurrence. Its state is a fixed-size matrix, so the memory a long sequence costs does not grow with its length. A short causal convolution (Conv1d + SiLU) sits in front of q, k and v.
-- **Chord attention** (`motif/block/attention/chord_attn.py`, `motif/ops/chord_attention.py`) is exact softmax attention whose scores carry a gated geometric-decay bias, `-alpha * (|d - mu| + eps) ** beta`, with `alpha`, `beta` and `mu` learnable per head (`mu` is frozen). This stands in for RoPE — a Bayesian positional prior at the cost of a few parameters per head. The softmax is stabilised against a `log_n` table, which is why the kernels take a `section_log_len` argument.
-- **Intra-block attention residual** (`motif/ops/attn_res.py`, `motif/model/cache.py`) makes each `Decoder` read the outputs of the earlier `Decoder`s in the same block through a learnable `pseudo_queries` vector and an `RMSNorm`, instead of the fixed `x + f(x)`. It is the lightweight intra-block form of Attention Residuals (Kimi Team), not a global aggregation across blocks. A fused Triton kernel implements the read; `can_use_triton_attn_res` reports whether a given call qualifies, and the layer falls back to an eager path otherwise. In the figure, `w` marks an RMSNorm, `s` a sigmoid gate and `a` an attn-res read.
+- **Gated delta-net** carries three of the four sub-layers with a linear-time chunked recurrence. Its state is a fixed-size matrix, so the memory a long sequence costs does not grow with its length. A short causal convolution (Conv1d + SiLU) sits in front of q, k and v.
+- **Chord attention** is exact softmax attention whose scores carry a gated geometric-decay bias, `-alpha * (|d - mu| + eps) ** beta`, with `alpha`, `beta` and `mu` learnable per head (`mu` is frozen). This stands in for RoPE — a Bayesian positional prior at the cost of a few parameters per head, and no position table to extend.
+- **Intra-block attention residual** makes each sub-layer read the outputs of the earlier sub-layers in the same block through a learnable query vector and an RMSNorm, instead of the fixed `x + f(x)`. It is the lightweight intra-block form of Attention Residuals (Kimi Team), not a global aggregation across blocks. A fused Triton kernel implements the read, with an eager fallback when a call does not qualify. In the figure, `w` marks an RMSNorm, `s` a sigmoid gate and `a` an attn-res read.
 
 The architecture follows Gated DeltaNet (Yang et al., 2025), Attention Residuals (Kimi Team, 2026), the Bayesian Attention Mechanism (Bianchessi et al., 2026) and the Qwen3 hybrid-attention recipe.
 
@@ -46,7 +46,7 @@ The architecture follows Gated DeltaNet (Yang et al., 2025), Attention Residuals
 - **Primary**: text completion and continuation with the base weights; research on hybrid attention, linear-attention recurrence and attention residuals; a small local model for CPU or single-GPU experiments.
 - **Out of scope**: instruction following, chat, tool use, retrieval, safety-critical or production decisions, and any use that treats the output as factual. The weights have had **no** instruction tuning and **no** alignment; the model continues text, which includes continuing it badly.
 
-The codebase supports post-training and a chat template, but no chat checkpoint is released. With these weights, use plain text completion.
+Post-training and a chat template exist for development, but no chat checkpoint is released. With these weights, use plain text completion.
 
 ## How to use
 
@@ -71,7 +71,7 @@ generation = TextGeneration(
 print(generation.run().text)
 ```
 
-`from_pretrained` accepts a safetensors file or shard directory (with an optional `config.json` sidecar), a bare `state_dict` checkpoint, and the training checkpoints written by this project's pipelines. When a file carries no config, the hyper-parameters are recovered from the tensor shapes.
+`from_pretrained` accepts a safetensors file or shard directory (with an optional `config.json` sidecar), a bare PyTorch state dict, and the training checkpoints written by this project's pipelines. When a file carries no config, the hyper-parameters are recovered from the tensor shapes.
 
 ### Sampling
 
@@ -89,7 +89,6 @@ The base weights were trained on raw text, so a plain prefix is the right prompt
 | Steps | 4,042,962 (the last checkpoint records `step = 4042960`) |
 | Sequence length | 1024 → 2048 → 4096, progressive |
 | Hardware | one 32 GB consumer GPU |
-| Precision | bfloat16, with float32 paths for the residual reads |
 | Final loss | cross-entropy ≈ 2.9 on the pretraining mixture |
 
 The stages the published curve marks with dashed lines:
@@ -132,7 +131,7 @@ One 32 GB consumer GPU; no cluster, and no CO2 estimate is published.
 
 ```bibtex
 @misc{codonproject2026motifchord,
-  title        = {MotifChord: a hybrid gated delta-net and chord attention language model},
+  title        = {MotifChord: Bayesian Positional Priors and Learned Attention Residuals},
   author       = {CodonProject},
   year         = {2026},
   howpublished = {\url{https://github.com/CodonProject/codon-motif}},
