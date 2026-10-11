@@ -193,3 +193,6 @@ pytest-cache-files-*/
 
 # Internal refactoring notes: not part of the published repository.
 REFACTOR_PLAN.md
+
+# Temporary research sandbox: local experiments, not part of the published repository.
+.research/
