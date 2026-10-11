@@ -179,3 +179,17 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
+
+# Local scratch space: throwaway probes, verification scripts and smoke checkpoints.
+# The harness blocks writes to the system temp directory, so scratch files live here.
+.tmp/
+
+# Model weights are published as release assets, never committed.
+*.pt
+*.safetensors
+
+# pytest cache directories the harness sandbox creates in the repository root.
+pytest-cache-files-*/
+
+# Internal refactoring notes: not part of the published repository.
+REFACTOR_PLAN.md

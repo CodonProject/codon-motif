@@ -1,0 +1,248 @@
+{%- set image_count = namespace(value=0) -%}
+{%- set audio_count = namespace(value=0) -%}
+{%- set video_count = namespace(value=0) -%}
+
+{%- set image_capab = image_capab | default(false, true) -%}
+{%- set audio_capab = audio_capab | default(false, true) -%}
+{%- set video_capab = video_capab | default(false, true) -%}
+
+{%- set attachment_strict = attachment_strict | default(false, true) -%}
+{%- set add_attachment_id = add_attachment_id | default(false, true) -%}
+
+{%- set role_strict = role_strict | default(false, true) -%}
+{%- set split_think = split_think | default(true, true) -%}
+
+{#- Reasoning-section switches. `enable_think` owns the whole section
+    (`<|thought_start|>` / `<|thought_end|>`); `enable_effort` only owns the effort
+    token that sits right after the opener. Both stay on unless a caller turns them
+    off, so the default rendering is unchanged. Turning `enable_think` off drops the
+    section entirely, and the effort token goes with it: an effort level describes a
+    reasoning section that is no longer there. `enable_thinking` is the switch callers
+    already pass; `enable_thinking=false` keeps its historical meaning of "open the
+    section, but do not write an effort token", which is also what `enable_effort=false`
+    does. -#}
+{%- set enable_think = enable_think | default(true) -%}
+{%- set enable_effort = enable_effort | default(true) -%}
+
+{%- macro render_effort(level) -%}
+    {%- set aliases = {
+        'minimal': 'low', 'low': 'low',
+        'medium': 'high', 'high': 'high', 'xhigh': 'high',
+        'max': 'max', 'ultra': 'max'
+    } -%}
+    {%- set alias = (level | default('high', true) | string | trim | lower) or 'high' -%}
+    {%- if alias not in aliases -%}
+        {{- raise_exception("Unexpected effort level: " ~ alias ~ " (expected 'minimal', 'low', 'medium', 'high', 'xhigh', 'max' or 'ultra')") -}}
+    {%- endif -%}
+    {{- '<|effort_' ~ aliases[alias] ~ '|>' -}}
+{%- endmacro -%}
+
+{#- The opening of a reasoning section: the thought marker, then the effort token
+    when it is switched on. Empty when `enable_think` is off - the section is not
+    opened at all. -#}
+{%- macro reasoning_opener(level) -%}
+    {%- if enable_think -%}
+        {%- if enable_effort -%}
+            {{- '<|thought_start|>' -}}{{- render_effort(level) -}}
+        {%- else -%}
+            {{- '<|thought_start|><|thought_end|>' -}}
+        {%- endif -%}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro render_content(content, is_system=false) -%}
+    {%- if content is string -%}
+        {{- content -}}
+    {%- elif content is mapping -%}
+        {{- content | tojson(ensure_ascii=false) -}}
+    {%- elif content is iterable and content is not mapping -%}
+        {%- for item in content -%}
+            {%- set item_type = item.type | default('') -%}
+            {%- if item_type == 'text' or item.text is defined -%}
+                {{- item.text | default('') -}}
+            {%- elif item_type == 'image' or 'image_url' in item or 'image' in item -%}
+                {%- if is_system -%}
+                    {%- if attachment_strict -%}
+                        {{- raise_exception('System message cannot contain images.') -}}
+                    {%- endif -%}
+                {%- elif image_capab -%}
+                    {%- set image_count.value = image_count.value + 1 -%}
+                    {%- if add_attachment_id -%}
+                        {{- 'Picture ' ~ image_count.value ~ ': ' -}}
+                    {%- endif -%}
+                    {{- '<|modality_image_start|><|modality_image_pad|><|modality_image_end|>' -}}
+                {%- else -%}
+                    {%- if attachment_strict -%}
+                        {{- raise_exception('Unsupported modality: images.') -}}
+                    {%- else -%}
+                        {{- 'Your image modality is unsupported' -}}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- elif item_type == 'audio' or 'audio_url' in item or 'audio' in item -%}
+                {%- if is_system -%}
+                    {%- if attachment_strict -%}
+                        {{- raise_exception('System message cannot contain audios.') -}}
+                    {%- endif -%}
+                {%- elif audio_capab -%}
+                    {%- set audio_count.value = audio_count.value + 1 -%}
+                    {%- if add_attachment_id -%}
+                        {{- 'Audio ' ~ audio_count.value ~ ': ' -}}
+                    {%- endif -%}
+                    {{- '<|modality_audio_start|><|modality_audio_pad|><|modality_audio_end|>' -}}
+                {%- else -%}
+                    {%- if attachment_strict -%}
+                        {{- raise_exception('Unsupported modality: audio.') -}}
+                    {%- else -%}
+                        {{- 'Your audio modality is unsupported' -}}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- elif item_type == 'video' or 'video_url' in item or 'video' in item -%}
+                {%- if is_system -%}
+                    {%- if attachment_strict -%}
+                        {{- raise_exception('System message cannot contain videos.') -}}
+                    {%- endif -%}
+                {%- elif video_capab -%}
+                    {%- set video_count.value = video_count.value + 1 -%}
+                    {%- if add_attachment_id -%}
+                        {{- 'Video ' ~ video_count.value ~ ': ' -}}
+                    {%- endif -%}
+                    {{- '<|modality_video_start|>' -}}
+                    {%- if item.frames -%}
+                        {%- for frame in item.frames -%}
+                            {%- if not loop.first -%}
+                                {{- '<|frame_sep|>' -}}
+                            {%- endif -%}
+                            {%- if frame is mapping and frame.timestamp is defined and frame.timestamp is not none -%}
+                                {{- '<|timestamp_pad|><|timestamp_frame_divider|>' -}}
+                            {%- endif -%}
+                            {{- '<|frame_pad|>' -}}
+                        {%- endfor -%}
+                    {%- else -%}
+                        {{- '<|modality_video_pad|>' -}}
+                    {%- endif -%}
+                    {{- '<|modality_video_end|>' -}}
+                {%- else -%}
+                    {%- if attachment_strict -%}
+                        {{- raise_exception('Unsupported modality: video.') -}}
+                    {%- else -%}
+                        {{- 'Your video modality is unsupported' -}}
+                    {%- endif -%}
+                {%- endif -%}
+            {%- endif -%}
+        {%- endfor -%}
+    {%- endif -%}
+{%- endmacro -%}
+
+{%- macro render_tool_calls(tool_calls) -%}
+    {%- for tool_call in tool_calls -%}
+        {%- set func = tool_call.function if tool_call.function is defined else tool_call -%}
+        {{- '<|tool_call_start|>' -}}{{- func.name -}}{{- '<|tool_name_divider|>' -}}
+        {%- if func.arguments is mapping or (func.arguments is sequence and func.arguments is not string) -%}
+            {{- func.arguments | tojson(ensure_ascii=false) -}}
+        {%- elif func.arguments is string -%}
+            {%- set stripped_args = func.arguments | trim -%}
+            {%- if (stripped_args.startswith('{') and stripped_args.endswith('}')) or (stripped_args.startswith('[') and stripped_args.endswith(']')) -%}
+                {{- stripped_args -}}
+            {%- else -%}
+                {{- {'args': func.arguments} | tojson(ensure_ascii=false) -}}
+            {%- endif -%}
+        {%- else -%}
+            {{- func.arguments | string -}}
+        {%- endif -%}
+        {{- '<|tool_call_end|>' -}}
+    {%- endfor -%}
+{%- endmacro -%}
+
+{%- if not messages -%}
+    {{- raise_exception('Messages list is empty.') -}}
+{%- endif -%}
+
+{%- set first_msg = messages[0] if messages else none -%}
+{%- set first_system = first_msg if (first_msg and first_msg.role in ['system', 'developer']) else none -%}
+{%- if first_system or tools -%}
+    {{- '<|im_start|><|system|>' -}}
+    {%- if first_system -%}
+        {{- render_content(first_system.content, is_system=true) | trim -}}
+        {%- if tools -%}
+            {{- '\n\n# You have access to the following functions:\n' -}}
+        {%- endif -%}
+    {%- elif tools -%}
+        {{- '# You have access to the following functions:\n' -}}
+    {%- endif -%}
+    
+    {%- if tools -%}
+        {%- for tool in tools -%}
+            {{- '\n' ~ tool | tojson(ensure_ascii=False) -}}
+        {%- endfor -%}
+        {{- '\n\nTo call a tool, output: <|tool_call_start|>tool_name<|tool_name_divider|>{"arg": "val"}<|tool_call_end|>' -}}
+    {%- endif -%}
+    {{- '<|im_end|>' -}}
+{%- endif -%}
+
+{%- for message in messages -%}
+
+    {%- if first_system is not none and message == first_system -%}
+        {#- Skip first system -#}
+    {%- elif message.role in ['system', 'developer'] -%}
+        {{- '<|im_start|><|system|>' -}}
+        {{- render_content(message.content, is_system=true) | trim -}}
+        {{- '<|im_end|>' -}}
+    {%- elif message.role in ['user', 'human'] -%}
+        {{- '<|im_start|><|human|>' -}}
+        {{- render_content(message.content) | trim -}}
+        {{- '<|im_end|>' -}}
+    {%- elif message.role in ['assistant', 'model'] -%}
+        {{- '<|im_start|><|model|>' -}}
+        {%- set thought_content = ((message.thought if message.thought is defined else none) or (message.reasoning_content if message.reasoning_content is defined else none)) | default('', true) -%}
+        {%- set content = message.content -%}
+        {%- if not thought_content | trim and content is string and '</think>' in content and (content | trim).startswith('<think>') and split_think -%}
+            {%- set thought_content = content.split('</think>')[0].strip().split('<think>')[-1].strip() -%}
+            {%- set content = content.split('</think>')[-1].strip() -%}
+        {%- endif %}
+        {%- if not enable_think -%}
+            {#- Thinking switched off: the turn carries no reasoning section, and any
+                reasoning content it holds is dropped with the markers. -#}
+        {%- elif thought_content -%}
+            {{- reasoning_opener(message.effort | default(message.reasoning_effort, true) | default(effort, true)) -}}
+            {{- thought_content | trim -}}{{- '<|thought_end|>' -}}
+        {%- else -%}
+            {#- No reasoning content: still render the section, so every model turn has
+                the same shape as a generation prompt opened without thinking. -#}
+            {{- '<|thought_start|><|thought_end|>' -}}
+        {%- endif -%}
+        {%- if message.tool_calls -%}
+            {{- render_tool_calls(message.tool_calls) -}}
+        {%- endif -%}
+        {%- if content -%}
+            {{- render_content(content) | trim -}}
+        {%- endif -%}
+        {{- '<|im_end|>' -}}
+    {%- elif message.role in ['tool', 'tool_response'] -%}
+        {{- '<|im_start|><|tool_response|>' -}}
+        {%- if message.name is defined -%}
+            {{- message.name -}}{{- '<|tool_name_divider|>' -}}
+        {%- endif -%}
+        {{- render_content(message.content) | trim -}}
+        {{- '<|im_end|>' -}}
+    {%- else %}
+        {%- if role_strict -%}
+            {{- raise_exception('Unexpected message role: ' ~ message.role) -}}
+        {%- endif %}
+    {%- endif %}
+
+{%- endfor -%}
+
+{%- if add_generation_prompt -%}
+    {{- '<|im_start|><|model|>' -}}
+    {#- `enable_thinking=false` and `enable_effort=false` both mean the same thing here:
+        the section is still opened, but no effort token is written into it. The effort
+        is rendered first so an out-of-range level is still refused when the section is
+        switched off. -#}
+    {%- set prompt_effort = render_effort(effort) -%}
+    {%- if not enable_think -%}
+    {%- elif enable_effort and (enable_thinking is not defined or enable_thinking) -%}
+        {{- '<|thought_start|>' -}}{{- prompt_effort -}}
+    {%- else -%}
+        {{- '<|thought_start|><|thought_end|>' -}}
+    {%- endif -%}
+{%- endif -%}
