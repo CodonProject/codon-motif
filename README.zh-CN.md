@@ -1,6 +1,6 @@
 # Motif Chord 语言模型
 
-[English](README.md) | [中文](#motif-chord-语言模型)
+[English](https://github.com/CodonProject/codon-motif/blob/main/README.md) | [中文](#motif-chord-语言模型)
 
 Motif Chord 是一个对 CPU 友好的小型 decoder-only 因果语言模型，采用混合注意力机制，在长上下文中兼顾了内存占用低与计算效率高：
 
@@ -12,7 +12,7 @@ Motif Chord 是一个对 CPU 友好的小型 decoder-only 因果语言模型，�
 
 Gated Delta 层与 Chord 层默认使用 3:1 的比例组成一个 Block，以在长文本效率与精确检索能力之间取得最优平衡。整体结构如下图所示：
 
-![model](./asset/model.png)
+![model](https://raw.githubusercontent.com/CodonProject/codon-motif/main/asset/model.png)
 
 #### 1. 混合注意力
 
@@ -106,7 +106,7 @@ print(generation.run().text)
 
 训练全程平稳，最终 Cross-Entropy Loss 收敛于 2.8 附近，无明显的 Loss Spike 现象，证明了 AttnRes + 3:1 混合注意力架构在单卡训练下的数值稳定性。
 
-![loss_fg](./asset/loss_fg.png)
+![loss_fg](https://raw.githubusercontent.com/CodonProject/codon-motif/main/asset/loss_fg.png)
 
 ### 致谢
 

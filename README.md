@@ -1,6 +1,6 @@
 # Motif Chord Language Model
 
-[English](#motif-chord-language-model) | [中文](README.zh-CN.md)
+[English](#motif-chord-language-model) | [中文](https://github.com/CodonProject/codon-motif/blob/main/README.zh-CN.md)
 
 Motif Chord is a small, CPU-friendly decoder-only causal language model with a mixed attention trunk: low memory use and high compute efficiency at long context.
 
@@ -12,7 +12,7 @@ Motif Chord is a small, CPU-friendly decoder-only causal language model with a m
 
 Gated Delta and Chord layers form one Block at a default 3:1 ratio, which balances long-text efficiency against exact retrieval. The overall structure:
 
-![model](./asset/model.png)
+![model](https://raw.githubusercontent.com/CodonProject/codon-motif/main/asset/model.png)
 
 #### 1. Hybrid attention
 
@@ -106,7 +106,7 @@ The model was pretrained on 13.78B tokens over 4,042,962 steps, using a progress
 
 Training stayed stable throughout: the final cross-entropy loss converged around 2.8 with no visible loss spikes, which is the numerical-stability evidence for AttnRes plus the 3:1 hybrid attention recipe on a single card.
 
-![loss_fg](./asset/loss_fg.png)
+![loss_fg](https://raw.githubusercontent.com/CodonProject/codon-motif/main/asset/loss_fg.png)
 
 ### Acknowledgements
 
