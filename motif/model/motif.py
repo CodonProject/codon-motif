@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from motif.block.decoder import DecoderBlock
-from motif.model.cache import ModelCache
+from motif.model.cache import ModelCache, build_cache
 from motif.model.checkpoint import (
     LoadedCheckpoint,
     config_from_mapping,
@@ -410,7 +410,12 @@ class MotifChordModel(nn.Module):
             for block in self.blocks
         ]
 
-    def create_cache(self, use_attn: Optional[bool] = None) -> ModelCache:
+    def create_cache(
+        self,
+        use_attn: Optional[bool] = None,
+        functional: bool = False,
+        wide_kv: bool = False,
+    ) -> ModelCache:
         '''
         Build the cache of the whole model.
 
@@ -423,17 +428,31 @@ class MotifChordModel(nn.Module):
             layer caches detach internally and enabling them would break the
             gradient flow.
 
+        The two remaining switches shape the chord caches for tracing:
+          * `functional` concatenates keys / values instead of copying them into a
+            growing buffer, so the cache can be an input and an output of a graph;
+          * `wide_kv` stores one copy of every head, which removes the grouped-query
+            expansion - the operation a graph over a dynamic sequence length cannot
+            trace - at `num_heads / num_kv_heads` times the cache memory.
+        Both leave a plain torch run numerically identical and exist for
+        `torch.export` (see `.research/onnx`).
+
         Args:
             use_attn (Optional[bool]): Force the per-layer attention caches on or
                 off; None derives it from the training flag.
+            functional (bool): Keep keys / values by concatenation instead of
+                copying into a growing buffer.
+            wide_kv (bool): Expand every key / value to all query heads on write.
 
         Returns:
             ModelCache: The (possibly empty) cache for this model.
         '''
-        if use_attn is None:
-            use_attn = not self.training
-        types_per_block = self.cache_types() if use_attn else [[] for _ in self.blocks]
-        return ModelCache.create_for(types_per_block)
+        return build_cache(
+            self,
+            use_attn=use_attn,
+            functional=functional,
+            wide_kv=wide_kv,
+        )
 
     def set_sampler(self, sampler: Optional[Sampler] = None, **kwargs) -> 'MotifChordModel':
         '''

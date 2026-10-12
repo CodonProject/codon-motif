@@ -39,6 +39,37 @@ class BasicLayerCache:
         raise NotImplementedError
 
 
+def _widen_heads(x: torch.Tensor, num_heads: int) -> torch.Tensor:
+    '''
+    Repeat every key / value head so the tensor carries one copy per query head.
+
+    The repeat is the one `ChordAttention` would do on the way out (head `h` of a
+    grouped projection serves `num_heads // num_kv_heads` consecutive query heads),
+    applied here to the incoming token instead.
+
+    Args:
+        x (torch.Tensor): Grouped keys or values, `[B, H_kv, T, D]`.
+        num_heads (int): Number of query heads to store per position.
+
+    Returns:
+        torch.Tensor: `[B, num_heads, T, D]`, unchanged when already wide.
+
+    Raises:
+        ValueError: If `num_heads` is not a multiple of the grouped head count.
+    '''
+    batch_size, kv_heads, length, head_dim = x.shape
+    if kv_heads == num_heads:
+        return x
+    if num_heads % kv_heads:
+        raise ValueError(
+            f'cannot store {num_heads} heads from {kv_heads} grouped heads: the '
+            f'query-head count must be a multiple of the key / value head count')
+    queries = num_heads // kv_heads
+    return x[:, :, None].expand(
+        batch_size, kv_heads, queries, length, head_dim,
+    ).reshape(batch_size, num_heads, length, head_dim)
+
+
 class KVLayerCache(BasicLayerCache):
     '''
     Key / value cache of the chord attention layer.
@@ -46,22 +77,63 @@ class KVLayerCache(BasicLayerCache):
     The buffers are allocated with slack and grown geometrically, so appending a
     single token while decoding does not reallocate on every step.
 
+    Passing `num_heads` makes the cache **wide**: the grouped keys / values are
+    expanded to every query head as they are written, so the read side sees a cache
+    that is already expanded and skips the grouped-query expansion. That costs
+    `num_heads / num_kv_heads` times the memory and buys nothing on eager torch - it
+    exists for traced graphs, where the expansion across a *dynamic* sequence length
+    is the one operation `torch.export` cannot guard. The expansion itself is cheap
+    to trace because it only ever sees the new tokens, whose count is static.
+
     Attributes:
         k (Optional[torch.Tensor]): Cached keys, `[B, H, capacity, D]`.
         v (Optional[torch.Tensor]): Cached values, `[B, H, capacity, D]`.
         length (int): Number of valid positions in `k` / `v`.
         _owned (bool): True once the buffers are owned by the cache, False while they
             still alias the tensors handed in by the first `update` call.
+        num_heads (Optional[int]): Heads stored per position, or None to keep the
+            grouped layout of the projection and expand on read.
     '''
 
-    def __init__(self):
+    def __init__(self, num_heads: Optional[int] = None):
         '''
         Start from an empty cache.
+
+        Args:
+            num_heads (Optional[int]): Query heads to expand every key / value to, or
+                None for the narrow (grouped) layout.
         '''
         self.k: Optional[torch.Tensor] = None
         self.v: Optional[torch.Tensor] = None
         self.length: int = 0
         self._owned: bool = False
+        self.num_heads: Optional[int] = None if num_heads is None else int(num_heads)
+
+    @property
+    def wide(self) -> bool:
+        '''
+        Returns:
+            bool: True when the cache stores one copy of every head.
+        '''
+        return self.num_heads is not None
+
+    def _prepare(self, k_new: torch.Tensor, v_new: torch.Tensor
+                 ) -> Tuple[torch.Tensor, torch.Tensor]:
+        '''
+        Expand new keys / values to every head when this cache is wide.
+
+        Args:
+            k_new (torch.Tensor): New keys, `[B, H_kv, T, D]`.
+            v_new (torch.Tensor): New values, `[B, H_kv, T, D]`.
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: `[B, num_heads, T, D]` when wide, the
+            inputs unchanged when narrow.
+        '''
+        if self.num_heads is None:
+            return k_new, v_new
+        return (_widen_heads(k_new, self.num_heads),
+                _widen_heads(v_new, self.num_heads))
 
     @property
     def seq_length(self) -> int:
@@ -106,7 +178,8 @@ class KVLayerCache(BasicLayerCache):
 
         The new tensors are detached, so a cache never keeps the graph of the step
         that produced them. The first call aliases the passed tensors, later ones
-        copy into the cache's own buffers.
+        copy into the cache's own buffers. A wide cache expands the new keys /
+        values to every head before storing them.
 
         Args:
             k_new (torch.Tensor): New keys.
@@ -117,6 +190,7 @@ class KVLayerCache(BasicLayerCache):
             Tuple[torch.Tensor, torch.Tensor]: All cached keys and values, including
             the new ones.
         '''
+        k_new, v_new = self._prepare(k_new, v_new)
         n_new = k_new.shape[dim]
         if self.k is None:
             self.k = k_new.detach()
@@ -174,7 +248,8 @@ class KVLayerCache(BasicLayerCache):
         Returns:
             str: A short debug representation.
         '''
-        return f'KVLayerCache(seq_length={self.length}, owned={self._owned})'
+        heads = '' if self.num_heads is None else f', heads={self.num_heads}'
+        return f'KVLayerCache(seq_length={self.length}, owned={self._owned}{heads})'
 
 
 class FunctionalKVLayerCache(KVLayerCache):
@@ -205,6 +280,7 @@ class FunctionalKVLayerCache(KVLayerCache):
             Tuple[torch.Tensor, torch.Tensor]: All cached keys and values, including
             the new ones.
         '''
+        k_new, v_new = self._prepare(k_new, v_new)
         if self.k is None:
             self.k = k_new.detach()
             self.v = v_new.detach()
@@ -222,7 +298,8 @@ class FunctionalKVLayerCache(KVLayerCache):
         Returns:
             str: A short debug representation.
         '''
-        return f'FunctionalKVLayerCache(seq_length={self.length})'
+        heads = '' if self.num_heads is None else f', heads={self.num_heads}'
+        return f'FunctionalKVLayerCache(seq_length={self.length}{heads})'
 
 
 class GatedDeltaAttentionLayerCache(BasicLayerCache):
@@ -546,21 +623,6 @@ class DecoderBlockCache:
     attn_res: AttnResCache = field(default_factory=AttnResCache)
     attn: List[Optional[BasicLayerCache]] = field(default_factory=list)
 
-    @classmethod
-    def create(cls, cache_types: Sequence[type] = ()) -> "DecoderBlockCache":
-        '''
-        Instantiate every attention cache of this block from the given types.
-
-        Args:
-            cache_types (Sequence[type]): Usually the `cache_type` of every
-                `Decoder` (`KVLayerCache` / `GatedDeltaAttentionLayerCache`); outside
-                training mode its length equals `len(config.block)`.
-
-        Returns:
-            DecoderBlockCache: A cache holding one layer cache per type.
-        '''
-        return cls(attn=[cache_type() for cache_type in cache_types])
-
     def ensure_attn(self, cache_types: Sequence[type]) -> None:
         '''
         Lazily fill the layer-cache slots (only an empty list is filled; existing
@@ -664,27 +726,6 @@ class ModelCache:
         '''
         return cls(blocks=[DecoderBlockCache() for _ in range(num_blocks)])
 
-    @classmethod
-    def create_for(
-        cls,
-        cache_types_per_block: Sequence[Sequence[type]],
-    ) -> "ModelCache":
-        '''
-        Instantiate every cache at once from the per-block layer types (the attn-res
-        cache plus each layer's KV / GD cache); used outside training mode.
-
-        Args:
-            cache_types_per_block (Sequence[Sequence[type]]): Cache class per layer,
-                for every block.
-
-        Returns:
-            ModelCache: The fully instantiated cache.
-        '''
-        return cls(blocks=[
-            DecoderBlockCache.create(cache_types)
-            for cache_types in cache_types_per_block
-        ])
-
     def reset(self):
         '''
         Reset every block cache.
@@ -756,3 +797,51 @@ class ModelCache:
             str: A short debug representation.
         '''
         return f"ModelCache(num_blocks={len(self.blocks)})"
+
+
+def build_cache(
+    model,
+    use_attn: Optional[bool] = None,
+    functional: bool = False,
+    wide_kv: bool = False,
+) -> ModelCache:
+    '''
+    Build the cache of a whole model.
+
+    Args:
+        model: The model to build for; only its `training` flag, its blocks and the
+            cache type of every layer are read, so any object with the same attributes
+            works.
+        use_attn (Optional[bool]): Whether the per-layer attention caches are
+            instantiated; None instantiates them outside training mode, which is what
+            generation and export want.
+        functional (bool): Keep keys / values by concatenation
+            (`FunctionalKVLayerCache`) instead of copying into a growing buffer, so the
+            cache can be an input and an output of a traced graph.
+        wide_kv (bool): Expand every key / value to all query heads as it is written
+            (`KVLayerCache(num_heads=...)`), which removes the grouped-query expansion
+            from the graph - the one operation a dynamic sequence length cannot trace -
+            at `num_heads / num_kv_heads` times the cache memory.
+
+    Returns:
+        ModelCache: One `DecoderBlockCache` per block, with the layer caches
+        instantiated when `use_attn` is true.
+    '''
+    if use_attn is None:
+        use_attn = not getattr(model, 'training', False)
+    if not use_attn:
+        return ModelCache.create(len(model.blocks))
+
+    blocks = []
+    for block in model.blocks:
+        attn: List[BasicLayerCache] = []
+        for decoder in block.features:
+            cache_type = decoder.cache_type
+            if functional and issubclass(cache_type, KVLayerCache):
+                cache_type = FunctionalKVLayerCache
+            if wide_kv and issubclass(cache_type, KVLayerCache):
+                attn.append(cache_type(num_heads=decoder.attn.num_heads))
+            else:
+                attn.append(cache_type())
+        blocks.append(DecoderBlockCache(attn=attn))
+    return ModelCache(blocks=blocks)

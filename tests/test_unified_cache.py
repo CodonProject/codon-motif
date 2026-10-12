@@ -8,6 +8,7 @@ from motif.model.cache import (
     GatedDeltaAttentionLayerCache,
     KVLayerCache,
     ModelCache,
+    build_cache,
 )
 from motif.model.motif import MotifChordModel
 
@@ -260,16 +261,6 @@ def test_cache_to_migrates_all_caches():
     assert torch.allclose(step.logits, full.logits[:, 6:7].double(), atol=1e-4)
 
 
-def _with_functional_kv(cache: ModelCache) -> ModelCache:
-    '''Replace every key / value layer cache with its out-of-place twin.'''
-    for block_cache in cache:
-        block_cache.attn = [
-            FunctionalKVLayerCache() if isinstance(c, KVLayerCache) else c
-            for c in block_cache.attn
-        ]
-    return cache
-
-
 def test_functional_kv_cache_decodes_like_the_in_place_one():
     '''An out-of-place key / value cache must decode like the in-place one.'''
     torch.manual_seed(0)
@@ -280,7 +271,7 @@ def test_functional_kv_cache_decodes_like_the_in_place_one():
     with torch.no_grad():
         step = model(ids[:, 6:7], cache=model(ids[:, :6]).cache).logits
 
-        functional = _with_functional_kv(model.create_cache())
+        functional = model.create_cache(functional=True)
         prefill = model(ids[:, :6], cache=functional)
         second = model(ids[:, 6:7], cache=prefill.cache).logits
 
@@ -292,62 +283,94 @@ def test_functional_kv_cache_decodes_like_the_in_place_one():
     assert layer.k.shape[2] == 7, 'the functional cache must not pad its buffers'
 
 
-class _WideKVCache(KVLayerCache):
-    '''A key / value cache that keeps one copy of every head.'''
-
-    def __init__(self, num_heads: int, head_dim: int):
-        super().__init__()
-        self.num_heads = num_heads
-        self.head_dim = head_dim
-
-    def _wide(self, x: torch.Tensor) -> torch.Tensor:
-        batch, kv_heads, length, _ = x.shape
-        queries = self.num_heads // kv_heads
-        return x[:, :, None].expand(
-            batch, kv_heads, queries, length, self.head_dim,
-        ).reshape(batch, self.num_heads, length, self.head_dim)
-
-    def update(self, k_new, v_new, dim=2):
-        k_new, v_new = self._wide(k_new), self._wide(v_new)
-        if self.k is None:
-            self.k, self.v = k_new.detach(), v_new.detach()
-        else:
-            self.k = torch.cat([self.k, k_new.detach()], dim=dim)
-            self.v = torch.cat([self.v, v_new.detach()], dim=dim)
-        self.length = self.k.shape[dim]
-        self._owned = True
-        return self.k, self.v
-
-
-def _with_wide_kv(model: MotifChordModel, cache: ModelCache) -> ModelCache:
-    '''Store one copy of every head, so the grouped-query expansion is skipped.'''
-    for block_cache, block in zip(cache, model.blocks):
-        block_cache.attn = [
-            _WideKVCache(layer.attn.num_heads, layer.attn.head_dim)
-            if isinstance(layer_cache, KVLayerCache) else layer_cache
-            for layer, layer_cache in zip(block.features, block_cache.attn)
-        ]
-    return cache
-
-
-def test_a_cache_holding_every_head_decodes_like_the_expanded_one():
-    '''Keys / values stored per head must decode like the expanded ones.'''
+def test_the_wide_layout_equals_the_one_expanded_on_read():
+    '''Storing every head must decode exactly like expanding them on the way out.'''
     torch.manual_seed(0)
     chord_only = ('chord', 'chord')
-    model = make_model(vocab_size=VOCAB, model_dim=64, head_k_dim=16,
-                       block=chord_only, block_n=1).eval()
+    model = make_model(vocab_size=VOCAB, model_dim=64, head_k_dim=16, block=chord_only, block_n=1).eval()
     attention = model.blocks[0].features[0].attn
     assert attention.num_kv_queries > 1, 'this test needs grouped-query attention'
     ids = torch.randint(0, VOCAB, (1, 6))
 
     with torch.no_grad():
         reference = model(ids[:, 5:6], cache=model(ids[:, :5]).cache).logits
-        wide = _with_wide_kv(model, model.create_cache())
+        wide = model.create_cache(wide_kv=True)
         out = model(ids[:, 5:6], cache=model(ids[:, :5], cache=wide).cache).logits
 
     assert torch.allclose(reference, out, atol=1e-6)
     assert torch.equal(reference.argmax(-1), out.argmax(-1))
-    assert wide[0].attn[0].k.shape[1] == attention.num_heads
+
+    layer = wide[0].attn[0]
+    assert layer.wide is True
+    assert layer.k.shape[1] == attention.num_heads
+    assert model.create_cache()[0].attn[0].wide is False
+
+
+class _WideChordStep(torch.nn.Module):
+    '''One decode step of a chord layer, with the cache as an input and an output.'''
+
+    def __init__(self, model: MotifChordModel):
+        '''
+        Args:
+            model (MotifChordModel): The model whose single chord layer is stepped.
+        '''
+        super().__init__()
+        self.model = model
+
+    def forward(self, input_ids, position, past_k, past_v):
+        '''
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor, torch.Tensor]: Logits and the keys /
+            values extended by this step.
+        '''
+        cache = build_cache(self.model, use_attn=True, functional=True, wide_kv=True)
+        layer = cache[0].attn[0]
+        layer.k, layer.v = past_k, past_v
+        out = self.model(input_ids, cache=cache, position=position)
+        return out.logits, cache[0].attn[0].k, cache[0].attn[0].v
+
+
+def test_a_wide_functional_cache_exports_over_a_dynamic_length():
+    '''
+    The cached length must stay a symbolic axis when the step is exported.
+
+    This is the whole reason the wide layout exists: expanding the grouped keys /
+    values on read touches the dynamic axis, and `torch.export` rejects the guard it
+    generates, while expanding the single new token on write does not.
+    '''
+    torch.manual_seed(0)
+    chord_only = ('chord',)
+    model = make_model(vocab_size=VOCAB, model_dim=64, head_k_dim=16,
+                       block=chord_only, block_n=1).eval()
+    attention = model.blocks[0].features[0].attn
+    step = _WideChordStep(model)
+    ids = torch.randint(0, VOCAB, (1, 1))
+
+    def state(length: int):
+        shape = (1, attention.num_heads, length, attention.head_dim)
+        return torch.randn(shape), torch.randn(shape)
+
+    past_k, past_v = state(4)
+    cached_length = torch.export.Dim('S', min=1)
+    program = torch.export.export(
+        step,
+        (ids, torch.tensor([4]), past_k, past_v),
+        dynamic_shapes={
+            'input_ids': None,
+            'position': None,
+            'past_k': {2: cached_length},
+            'past_v': {2: cached_length},
+        },
+    )
+
+    for length in (3, 6):
+        past_k, past_v = state(length)
+        position = torch.tensor([length])
+        expected = step(ids, position, past_k, past_v)
+        got = program.module()(ids, position, past_k, past_v)
+        assert got[1].shape[2] == length + 1
+        for want, got_one in zip(expected, got):
+            assert torch.allclose(want, got_one, atol=1e-5), 'exported step drifted'
 
 
 def test_a_tensor_position_matches_the_int_one():
