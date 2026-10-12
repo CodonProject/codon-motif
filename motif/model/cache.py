@@ -177,6 +177,54 @@ class KVLayerCache(BasicLayerCache):
         return f'KVLayerCache(seq_length={self.length}, owned={self._owned})'
 
 
+class FunctionalKVLayerCache(KVLayerCache):
+    '''
+    Key / value cache that never writes its buffers in place.
+
+    `update` returns a concatenation instead of copying into a growing buffer, so the
+    cached keys / values are plain function inputs and outputs: the same call can be
+    traced into a graph (and exported) and replayed with any sequence length, which
+    the in-place `KVLayerCache` cannot do.
+    '''
+
+    def update(
+        self,
+        k_new: torch.Tensor,
+        v_new: torch.Tensor,
+        dim: int = 2,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        '''
+        Append new keys / values and return the whole cached sequence.
+
+        Args:
+            k_new (torch.Tensor): New keys.
+            v_new (torch.Tensor): New values.
+            dim (int): Sequence dimension of the buffers (2 by default).
+
+        Returns:
+            Tuple[torch.Tensor, torch.Tensor]: All cached keys and values, including
+            the new ones.
+        '''
+        if self.k is None:
+            self.k = k_new.detach()
+            self.v = v_new.detach()
+        else:
+            if self.k.device != k_new.device:
+                self.to(k_new.device)
+            self.k = torch.cat([self.k, k_new.detach()], dim=dim)
+            self.v = torch.cat([self.v, v_new.detach()], dim=dim)
+        self.length = self.k.shape[dim]
+        self._owned = True
+        return self.k, self.v
+
+    def __repr__(self):
+        '''
+        Returns:
+            str: A short debug representation.
+        '''
+        return f'FunctionalKVLayerCache(seq_length={self.length})'
+
+
 class GatedDeltaAttentionLayerCache(BasicLayerCache):
     '''
     Recurrent state cache of the gated delta-net attention layer.
@@ -364,26 +412,27 @@ class AttnResCache:
         Register the block input representation.
 
         On the first forward the input becomes `blocks[0]`; on a continued run
-        (decode, or a new chunk) the new positions are appended to `blocks[0]` and
-        every representation left behind by the previous forward is dropped.
+        (decode, or a new chunk) it replaces it and every representation left behind
+        by the previous forward is dropped. `seq_len` keeps counting the total number
+        of positions the block has seen, because the historical part is never read
+        again: `_align` only ever looks at the tail of the current chunk, so keeping
+        the history would only cost memory and a per-step copy.
 
-        Only the historical part is detached: the input of the current chunk keeps
-        its graph, so continuing from a cache during training still propagates
-        gradients back to the current input, while the stale history graph is never
-        held by the cache.
+        The input keeps its graph, so continuing from a cache during training still
+        propagates gradients back to the current input, while nothing of the previous
+        forward is held by the cache.
 
         Args:
             hidden_states (torch.Tensor): `[B, q_len, D]` block input.
         '''
         q_len = hidden_states.shape[1]
         if len(self.blocks) == 0:
-            self.blocks.append(hidden_states)
+            self.seq_len = q_len
         else:
-            base = self.blocks[0]
-            self.blocks = [torch.cat([base.detach(), hidden_states], dim=1)]
+            self.seq_len = self.seq_len + q_len
             self.partial_block = None
+        self.blocks = [hidden_states]
         self.chunk_len = q_len
-        self.seq_len = self.blocks[0].shape[1]
 
     def update_increment(self, f_h: torch.Tensor):
         '''

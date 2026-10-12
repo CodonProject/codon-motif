@@ -9,7 +9,7 @@ from motif.ops import (
     HAS_TRITON
 )
 
-from typing import Optional
+from typing import Optional, Union
 
 
 _HALF_DTYPES = (torch.float16, torch.bfloat16)
@@ -141,7 +141,7 @@ class ChordAttention(BasicAttention):
         self,
         q_len: int,
         kv_len: int,
-        q_start: int,
+        q_start: Union[int, torch.Tensor],
         device: torch.device,
         dtype: torch.dtype = torch.float32,
     ) -> torch.Tensor:
@@ -155,7 +155,8 @@ class ChordAttention(BasicAttention):
         Args:
             q_len (int): Number of query positions in this call.
             kv_len (int): Number of key positions available (cache included).
-            q_start (int): Absolute position of the first query in the sequence.
+            q_start (int | torch.Tensor): Absolute position of the first query in the
+                sequence. A scalar tensor keeps the position out of the graph.
             device (torch.device): Device the distance grid is built on.
             dtype (torch.dtype): Output dtype (`torch.float32` by default).
 
@@ -164,7 +165,11 @@ class ChordAttention(BasicAttention):
         '''
         alpha, beta, mu = self._ggd_parameters()
         cd = alpha.dtype
-        q_pos = torch.arange(q_len, device=device, dtype=cd) + float(q_start)
+        if isinstance(q_start, torch.Tensor):
+            start = q_start.to(device=device, dtype=cd).reshape(-1)[0]
+            q_pos = torch.arange(q_len, device=device, dtype=cd) + start
+        else:
+            q_pos = torch.arange(q_len, device=device, dtype=cd) + float(q_start)
         k_pos = torch.arange(kv_len, device=device, dtype=cd)
         d = k_pos[None, :] - q_pos[:, None]
         b = torch.abs(d[None] - mu[:, None, None]) + _GGD_EPS
@@ -202,7 +207,7 @@ class ChordAttention(BasicAttention):
         kv_states: Optional[torch.Tensor] = None,
         attention_mask: Optional[torch.Tensor] = None,
         output_attentions: bool = False,
-        embedding_start: int = 0,
+        embedding_start: Union[int, torch.Tensor] = 0,
         past_key_value: Optional[KVLayerCache] = None,
         section_log_len: Optional[torch.Tensor] = None,
     ) -> AttentionOutput:
@@ -223,10 +228,15 @@ class ChordAttention(BasicAttention):
                 keep-mask, applied to the logits.
             output_attentions (bool): Also return the softmax weights and the
                 relative prior in `payload`.
-            embedding_start (int): Absolute position of the first token when no
-                cache is used.
+            embedding_start (int | torch.Tensor): Absolute position of the first
+                token when no cache is used, or overrides the position the cache
+                reports. Pass a scalar tensor to keep the position out of the graph
+                (required to export an incremental decoding step); the fused Triton
+                kernel is then skipped.
             past_key_value (Optional[KVLayerCache]): Cache to read from, and to
-                append the new keys / values to.
+                append the new keys / values to. A cache may hold either
+                `num_kv_heads` or `num_heads` heads; when it already holds
+                `num_heads` the grouped-query expansion below is skipped.
             section_log_len (Optional[torch.Tensor]): Optional `[B, q_len]` (or
                 `[B, q_len, 1]`) replacement for `log(n)`; defaults to the cached
                 log table.
@@ -251,10 +261,10 @@ class ChordAttention(BasicAttention):
         k = self.k_norm(k)
 
         use_cache = isinstance(past_key_value, KVLayerCache)
-        q_start = int(embedding_start)
+        q_start = embedding_start
         if use_cache:
             cached = past_key_value.seq_length
-            if q_start == 0 and cached > 0:
+            if isinstance(q_start, int) and q_start == 0 and cached > 0:
                 q_start = cached
             k, v = past_key_value.update(k, v, dim=2)
         current_key_value = past_key_value if use_cache else None
@@ -262,8 +272,15 @@ class ChordAttention(BasicAttention):
         kv_len = k.shape[2]
 
         if section_log_len is None:
-            log_n = _log_n_table(q_start + q_len, hidden_states.device)[
-                q_start:q_start + q_len]
+            if isinstance(q_start, torch.Tensor):
+                start = q_start.reshape(-1)[0].to(
+                    device=hidden_states.device, dtype=torch.float32)
+                log_n = torch.log(
+                    start + torch.arange(1, q_len + 1, dtype=torch.float32,
+                                         device=hidden_states.device))
+            else:
+                log_n = _log_n_table(q_start + q_len, hidden_states.device)[
+                    q_start:q_start + q_len]
         else:
             sl = section_log_len
             if sl.dim() == 3:
@@ -278,6 +295,7 @@ class ChordAttention(BasicAttention):
         if (HAS_TRITON and hidden_states.is_cuda
                 and hidden_states.dtype in _TRITON_DTYPES
                 and attention_mask is None and not output_attentions
+                and not isinstance(q_start, torch.Tensor)
                 and self.head_dim >= 16):
             try:
                 alpha, beta, mu = self._ggd_parameters()
@@ -295,7 +313,7 @@ class ChordAttention(BasicAttention):
                 return AttentionOutput(output=self.o_proj(out) * G, past_key_value=current_key_value)
             except Exception: pass
 
-        if self.num_kv_queries > 1:
+        if self.num_kv_queries > 1 and k.shape[1] != self.num_heads:
             k = k[:, :, None, :, :].expand(
                 batch_size, self.num_kv_heads, self.num_kv_queries,
                 kv_len, self.head_dim,
@@ -344,9 +362,11 @@ class ChordAttention(BasicAttention):
 
         payload = None
         if output_attentions:
+            start = (q_start if isinstance(q_start, int)
+                     else int(q_start.reshape(-1)[0]))
             payload = {
                 'prior': self.relative_prior(
-                    max(q_len - 1, kv_len - 1 - q_start, 1) + 1,
+                    max(q_len - 1, kv_len - 1 - start, 1) + 1,
                     device=logits.device,
                 ),
             }

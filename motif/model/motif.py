@@ -529,6 +529,7 @@ class MotifChordModel(nn.Module):
         cache: Optional[ModelCache] = None,
         labels: Optional[torch.Tensor] = None,
         mask: Optional[torch.Tensor] = None,
+        position: Optional[Union[int, torch.Tensor]] = None,
     ) -> ModelOutput:
         '''
         Run the model over `input_ids`.
@@ -555,6 +556,10 @@ class MotifChordModel(nn.Module):
                 recurrent layers keep their own state and do not read the mask, so a
                 padded batch is only fully isolated once it reaches the attention
                 layers that do.
+            position (Optional[int | torch.Tensor]): Absolute position of the first
+                token, handed to the attention layers that track positions. Defaults
+                to the position the cache reports. Pass a scalar tensor to decode
+                without baking the position into the graph.
 
         Returns:
             ModelOutput: Hidden states, logits, the optional loss, the cache and the
@@ -583,7 +588,7 @@ class MotifChordModel(nn.Module):
             cache = self.create_cache()
 
         for i, block in enumerate(self.blocks):
-            out = block(x, cache[i], mask)
+            out = block(x, cache[i], mask, 0 if position is None else position)
             x = out.hidden_states
 
         x = self.norm(x)

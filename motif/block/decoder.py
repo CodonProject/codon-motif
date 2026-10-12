@@ -1,7 +1,7 @@
 import torch
 import torch.nn as nn
 
-from typing import Literal, Optional, List
+from typing import Literal, Optional, List, Union
 from dataclasses import dataclass
 
 from motif.block.attention import (
@@ -141,6 +141,7 @@ class DecoderBlock(nn.Module):
         hidden_states: torch.Tensor,
         cache: Optional[DecoderBlockCache] = None,
         mask: Optional[torch.Tensor] = None,
+        position: Union[int, torch.Tensor] = 0,
     ) -> DecoderBlockOutput:
         '''
         Run every decoder of the block, threading the attention-residual state.
@@ -154,6 +155,9 @@ class DecoderBlock(nn.Module):
                 positions that may be attended (`[B, T]`, one row per batch row).
                 Only the attention layers that declare it receive it; the recurrent
                 layers (`gdn`) carry their own state and ignore it.
+            position (int | torch.Tensor): Absolute position of the first token, given
+                to the attention layers that track positions. A scalar tensor keeps
+                the position out of the graph.
 
         Returns:
             DecoderBlockOutput: The block representation and the updated cache.
@@ -193,6 +197,7 @@ class DecoderBlock(nn.Module):
                     hidden_states=decoder.attn_norm(h),
                     past_key_value=cache.attn[i] if use_attn_cache else None,
                     attention_mask=mask,
+                    embedding_start=position,
                 )
             else:
                 attn_out = decoder.attn(

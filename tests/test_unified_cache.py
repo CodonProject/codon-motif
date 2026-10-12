@@ -4,6 +4,7 @@ from motif.model.cache import (
     AttnResCache,
     BasicLayerCache,
     DecoderBlockCache,
+    FunctionalKVLayerCache,
     GatedDeltaAttentionLayerCache,
     KVLayerCache,
     ModelCache,
@@ -203,7 +204,7 @@ def test_decode_after_two_independent_prefills():
 
 
 def test_attn_res_continuation_keeps_current_input_gradient():
-    '''Continuation only detaches history; the input of the current chunk must keep its computation graph.'''
+    '''Continuation drops the history and keeps the current chunk input's computation graph.'''
     cache = AttnResCache()
 
     x1 = torch.randn(2, 4, 8, requires_grad=True)
@@ -218,8 +219,8 @@ def test_attn_res_continuation_keeps_current_input_gradient():
     assert cache.seq_len == 5
     assert cache.chunk_len == 1
     assert len(cache.blocks) == 1
-    assert cache.blocks[0].shape == (2, 5, 8)
-    assert torch.allclose(cache.blocks[0][:, -1:, :], x2)
+    assert cache.blocks[0].shape == (2, 1, 8)
+    assert torch.allclose(cache.blocks[0], x2)
 
     values = cache.values()
     assert values.shape == (1, 2, 1, 8)
@@ -257,6 +258,114 @@ def test_cache_to_migrates_all_caches():
         step = model64(ids[:, 6:7], cache=cache)
     assert step.logits.dtype == torch.float64
     assert torch.allclose(step.logits, full.logits[:, 6:7].double(), atol=1e-4)
+
+
+def _with_functional_kv(cache: ModelCache) -> ModelCache:
+    '''Replace every key / value layer cache with its out-of-place twin.'''
+    for block_cache in cache:
+        block_cache.attn = [
+            FunctionalKVLayerCache() if isinstance(c, KVLayerCache) else c
+            for c in block_cache.attn
+        ]
+    return cache
+
+
+def test_functional_kv_cache_decodes_like_the_in_place_one():
+    '''An out-of-place key / value cache must decode like the in-place one.'''
+    torch.manual_seed(0)
+    chord_only = ('chord', 'chord')
+    model = make_model(vocab_size=VOCAB, model_dim=64, head_k_dim=16, block=chord_only, block_n=1).eval()
+    ids = torch.randint(0, VOCAB, (1, 8))
+
+    with torch.no_grad():
+        step = model(ids[:, 6:7], cache=model(ids[:, :6]).cache).logits
+
+        functional = _with_functional_kv(model.create_cache())
+        prefill = model(ids[:, :6], cache=functional)
+        second = model(ids[:, 6:7], cache=prefill.cache).logits
+
+    assert torch.allclose(step, second, atol=1e-6)
+    assert torch.equal(step.argmax(-1), second.argmax(-1))
+
+    layer = functional[0].attn[0]
+    assert isinstance(layer, FunctionalKVLayerCache)
+    assert layer.k.shape[2] == 7, 'the functional cache must not pad its buffers'
+
+
+class _WideKVCache(KVLayerCache):
+    '''A key / value cache that keeps one copy of every head.'''
+
+    def __init__(self, num_heads: int, head_dim: int):
+        super().__init__()
+        self.num_heads = num_heads
+        self.head_dim = head_dim
+
+    def _wide(self, x: torch.Tensor) -> torch.Tensor:
+        batch, kv_heads, length, _ = x.shape
+        queries = self.num_heads // kv_heads
+        return x[:, :, None].expand(
+            batch, kv_heads, queries, length, self.head_dim,
+        ).reshape(batch, self.num_heads, length, self.head_dim)
+
+    def update(self, k_new, v_new, dim=2):
+        k_new, v_new = self._wide(k_new), self._wide(v_new)
+        if self.k is None:
+            self.k, self.v = k_new.detach(), v_new.detach()
+        else:
+            self.k = torch.cat([self.k, k_new.detach()], dim=dim)
+            self.v = torch.cat([self.v, v_new.detach()], dim=dim)
+        self.length = self.k.shape[dim]
+        self._owned = True
+        return self.k, self.v
+
+
+def _with_wide_kv(model: MotifChordModel, cache: ModelCache) -> ModelCache:
+    '''Store one copy of every head, so the grouped-query expansion is skipped.'''
+    for block_cache, block in zip(cache, model.blocks):
+        block_cache.attn = [
+            _WideKVCache(layer.attn.num_heads, layer.attn.head_dim)
+            if isinstance(layer_cache, KVLayerCache) else layer_cache
+            for layer, layer_cache in zip(block.features, block_cache.attn)
+        ]
+    return cache
+
+
+def test_a_cache_holding_every_head_decodes_like_the_expanded_one():
+    '''Keys / values stored per head must decode like the expanded ones.'''
+    torch.manual_seed(0)
+    chord_only = ('chord', 'chord')
+    model = make_model(vocab_size=VOCAB, model_dim=64, head_k_dim=16,
+                       block=chord_only, block_n=1).eval()
+    attention = model.blocks[0].features[0].attn
+    assert attention.num_kv_queries > 1, 'this test needs grouped-query attention'
+    ids = torch.randint(0, VOCAB, (1, 6))
+
+    with torch.no_grad():
+        reference = model(ids[:, 5:6], cache=model(ids[:, :5]).cache).logits
+        wide = _with_wide_kv(model, model.create_cache())
+        out = model(ids[:, 5:6], cache=model(ids[:, :5], cache=wide).cache).logits
+
+    assert torch.allclose(reference, out, atol=1e-6)
+    assert torch.equal(reference.argmax(-1), out.argmax(-1))
+    assert wide[0].attn[0].k.shape[1] == attention.num_heads
+
+
+def test_a_tensor_position_matches_the_int_one():
+    '''Passing the position as a scalar tensor must land on the same decode step.'''
+    torch.manual_seed(0)
+    chord_only = ('chord', 'chord')
+    model = make_model(vocab_size=VOCAB, model_dim=64, head_k_dim=16, block=chord_only, block_n=1).eval()
+    ids = torch.randint(0, VOCAB, (1, 5))
+
+    with torch.no_grad():
+        implicit = model(ids[:, 4:5], cache=model(ids[:, :4]).cache).logits
+        explicit = model(ids[:, 4:5], cache=model(ids[:, :4]).cache,
+                         position=torch.tensor([4])).logits
+        wrong = model(ids[:, 4:5], cache=model(ids[:, :4]).cache,
+                      position=torch.tensor([3])).logits
+
+    assert torch.allclose(implicit, explicit, atol=1e-6)
+    assert not torch.allclose(implicit, wrong, atol=1e-6), 'the position input is ignored'
 
 
 def _run_all():
