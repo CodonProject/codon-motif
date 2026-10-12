@@ -196,3 +196,6 @@ REFACTOR_PLAN.md
 
 # Temporary research sandbox: local experiments, not part of the published repository.
 .research/
+
+# Local launcher for motif.service with this checkout's paths baked in.
+/server.py

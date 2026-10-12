@@ -243,4 +243,16 @@ pytest
 
 `examples/` holds runnable scripts (`verify.py` checks the environment and weights first, `chat.py` talks to the model, `generate.py` continues text, `pretrain.py` and `sft.py` train). They need `tokenizer.zip` in the repository root or in `../`. Temporary artefacts (corpora, checkpoints, the Triton kernel cache) are written under `<repo>/.tmp` and ignored.
 
+Two optional packages sit next to the model itself, kept out of the core install because they pull their own dependencies:
+
+```bash
+pip install "codon-motif[onnx]"      # export a checkpoint to ONNX, and run it without PyTorch
+python -m motif.onnx.export_onnx --weights MotifChord-Base.safetensors --out out/fp16
+
+pip install "codon-motif[service]"   # serve that bundle in the OpenAI format
+python -m motif.service.server --bundle out/fp16 --no-torch
+```
+
+`motif.onnx` writes a decode graph plus one prefill graph per chunk size on top of a single shared weights file, and `motif.onnx.runtime` executes them with `onnxruntime` alone — no `torch`, a tokenizer included. `motif.service` adds `/v1/models`, `/v1/chat/completions` (streaming and not), `/v1/completions` and `/health`; it uses the ONNX runtime by default and only imports `motif` when a model instance or checkpoint is passed to it.
+
 Apache-2.0. See `LICENSE`. Intended use, training, evaluation and limitations are in [`MODEL_CARD.md`](https://github.com/CodonProject/codon-motif/blob/main/MODEL_CARD.md).

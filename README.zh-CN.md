@@ -243,4 +243,16 @@ pytest
 
 `examples/` 下有可直接运行的脚本（`verify.py` 先自检环境与权重，`chat.py` 对话，`generate.py` 续写，`pretrain.py` / `sft.py` 训练）；运行需要仓库根或 `../` 下的 `tokenizer.zip`。临时产物（语料、checkpoint、Triton kernel 缓存）写在 `<repo>/.tmp` 下并被忽略。
 
+模型本体之外还有两个可选包，各自带依赖，所以不进核心安装：
+
+```bash
+pip install "codon-motif[onnx]"      # 导出 ONNX，并在不装 PyTorch 的情况下推理
+python -m motif.onnx.export_onnx --weights MotifChord-Base.safetensors --out out/fp16
+
+pip install "codon-motif[service]"   # 用 OpenAI 兼容格式部署这份 bundle
+python -m motif.service.server --bundle out/fp16 --no-torch
+```
+
+`motif.onnx` 导出一张 decode 图、每个档位一张 prefill 图，五张图共享同一份 `weights.bin`；`motif.onnx.runtime` 只用 `onnxruntime` 执行它们——不需要 `torch`，自带 tokenizer。`motif.service` 在此之上提供 `/v1/models`、`/v1/chat/completions`（流式与非流式）、`/v1/completions` 和 `/health`；默认走 ONNX 运行时，只有在传入 model 实例或 checkpoint 时才导入 `motif`。
+
 Apache-2.0，见 `LICENSE`。用途、训练、评测与局限性见 [`MODEL_CARD.md`](https://github.com/CodonProject/codon-motif/blob/main/MODEL_CARD.md)（英文）。
