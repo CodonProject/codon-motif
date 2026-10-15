@@ -38,7 +38,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='chat with a codon-motif checkpoint')
     parser.add_argument('--ckpt', required=True, help='checkpoint to talk to')
     parser.add_argument('--system', default=None, help='system message for the session')
-    parser.add_argument('--max-new-tokens', type=int, default=160)
+    parser.add_argument('--max-new-tokens', type=int, default=1024)
     parser.add_argument('--temperature', type=float, default=0.8)
     parser.add_argument('--top-p', type=float, default=0.9)
     parser.add_argument('--repetition-penalty', type=float, default=1.1)
